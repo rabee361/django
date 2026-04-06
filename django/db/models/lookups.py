@@ -2,7 +2,15 @@ import itertools
 import math
 
 from django.core.exceptions import EmptyResultSet, FullResultSet
-from django.db.models.expressions import Case, ColPairs, Expression, Func, Value, When
+from django.db.models.expressions import (
+    Case,
+    ColPairs,
+    Expression,
+    ExpressionList,
+    Func,
+    Value,
+    When,
+)
 from django.db.models.fields import (
     BooleanField,
     CharField,
@@ -93,7 +101,7 @@ class Lookup(Expression):
         return Value(self.lhs)
 
     def get_db_prep_lookup(self, value, connection):
-        return ("%s", [value])
+        return ("%s", (value,))
 
     def process_lhs(self, compiler, connection, lhs=None):
         lhs = lhs or self.lhs
@@ -224,12 +232,12 @@ class BuiltinLookup(Lookup):
         lhs_sql = (
             connection.ops.lookup_cast(self.lookup_name, field_internal_type) % lhs_sql
         )
-        return lhs_sql, list(params)
+        return lhs_sql, tuple(params)
 
     def as_sql(self, compiler, connection):
         lhs_sql, params = self.process_lhs(compiler, connection)
         rhs_sql, rhs_params = self.process_rhs(compiler, connection)
-        params.extend(rhs_params)
+        params = (*params, *rhs_params)
         rhs_sql = self.get_rhs_op(connection, rhs_sql)
         return "%s %s" % (lhs_sql, rhs_sql), params
 
@@ -279,13 +287,22 @@ class FieldGetDbPrepValueIterableMixin(FieldGetDbPrepValueMixin):
     def get_prep_lookup(self):
         if hasattr(self.rhs, "resolve_expression"):
             return self.rhs
+        if any(hasattr(value, "resolve_expression") for value in self.rhs):
+            # Wrap direct values in Value expressions so they are handled by
+            # the database at compilation time, along with other expressions.
+            return ExpressionList(
+                *[
+                    (
+                        value
+                        if hasattr(value, "resolve_expression")
+                        else Value(value, getattr(self.lhs, "output_field", None))
+                    )
+                    for value in self.rhs
+                ]
+            )
         prepared_values = []
         for rhs_value in self.rhs:
-            if hasattr(rhs_value, "resolve_expression"):
-                # An expression will be handled by the database but can coexist
-                # alongside real values.
-                pass
-            elif (
+            if (
                 self.prepare_rhs
                 and hasattr(self.lhs, "output_field")
                 and hasattr(self.lhs.output_field, "get_prep_value")
@@ -299,6 +316,12 @@ class FieldGetDbPrepValueIterableMixin(FieldGetDbPrepValueMixin):
             # rhs should be an iterable of values. Use batch_process_rhs()
             # to prepare/transform those values.
             return self.batch_process_rhs(compiler, connection)
+        elif isinstance(self.rhs, ExpressionList):
+            # rhs contains at least one expression. Unwrap them and delegate
+            # to batch_process_rhs() to prepare/transform those values.
+            copy = self.copy()
+            copy.rhs = self.rhs.get_source_expressions()
+            return copy.process_rhs(compiler, connection)
         else:
             return super().process_rhs(compiler, connection)
 
@@ -345,16 +368,21 @@ class Exact(FieldGetDbPrepValueMixin, BuiltinLookup):
     def get_prep_lookup(self):
         from django.db.models.sql.query import Query  # avoid circular import
 
-        if isinstance(self.rhs, Query):
-            if self.rhs.has_limit_one():
-                if not self.rhs.has_select_fields:
-                    self.rhs.clear_select_clause()
-                    self.rhs.add_fields(["pk"])
-            else:
+        if isinstance(query := self.rhs, Query):
+            if not query.has_limit_one():
                 raise ValueError(
                     "The QuerySet value for an exact lookup must be limited to "
                     "one result using slicing."
                 )
+            lhs_len = len(self.lhs) if isinstance(self.lhs, (ColPairs, tuple)) else 1
+            if (rhs_len := query._subquery_fields_len) != lhs_len:
+                raise ValueError(
+                    f"The QuerySet value for the exact lookup must have {lhs_len} "
+                    f"selected fields (received {rhs_len})"
+                )
+            if not query.has_select_fields:
+                query.clear_select_clause()
+                query.add_fields(["pk"])
         return super().get_prep_lookup()
 
     def as_sql(self, compiler, connection):
@@ -382,7 +410,7 @@ class IExact(BuiltinLookup):
     def process_rhs(self, qn, connection):
         rhs, params = super().process_rhs(qn, connection)
         if params:
-            params[0] = connection.ops.prep_for_iexact_query(params[0])
+            params = (connection.ops.prep_for_iexact_query(params[0]), *params[1:])
         return rhs, params
 
 
@@ -467,18 +495,16 @@ class IntegerLessThanOrEqual(IntegerFieldOverflow, LessThanOrEqual):
 class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
     lookup_name = "in"
 
-    def get_refs(self):
-        refs = super().get_refs()
-        if self.rhs_is_direct_value():
-            for rhs in self.rhs:
-                if get_rhs_refs := getattr(rhs, "get_refs", None):
-                    refs |= get_rhs_refs()
-        return refs
-
     def get_prep_lookup(self):
         from django.db.models.sql.query import Query  # avoid circular import
 
         if isinstance(self.rhs, Query):
+            lhs_len = len(self.lhs) if isinstance(self.lhs, (ColPairs, tuple)) else 1
+            if (rhs_len := self.rhs._subquery_fields_len) != lhs_len:
+                raise ValueError(
+                    f"The QuerySet value for the 'in' lookup must have {lhs_len} "
+                    f"selected fields (received {rhs_len})"
+                )
             self.rhs.clear_ordering(clear_default=True)
             if not self.rhs.has_select_fields:
                 self.rhs.clear_select_clause()
@@ -552,30 +578,40 @@ class PatternLookup(BuiltinLookup):
     prepare_rhs = False
 
     def get_rhs_op(self, connection, rhs):
-        # Assume we are in startswith. We need to produce SQL like:
-        #     col LIKE %s, ['thevalue%']
-        # For python values we can (and should) do that directly in Python,
-        # but if the value is for example reference to other column, then
-        # we need to add the % pattern match to the lookup by something like
+        # If the lookup value is a reference to another column or a transform,
+        # then the SQL is something like:
         #     col LIKE othercol || '%%'
-        # So, for Python values we don't need any special pattern, but for
-        # SQL reference values or SQL transformations we need the correct
-        # pattern added.
-        if hasattr(self.rhs, "as_sql") or self.bilateral_transforms:
+        if not self.is_simple_lookup:
+            # In that case, prepare the LIKE clause using
+            # DatabaseWrapper.pattern_ops.
             pattern = connection.pattern_ops[self.lookup_name].format(
                 connection.pattern_esc
             )
             return pattern.format(rhs)
         else:
+            # Otherwise, use the LIKE in DatabaseWrapper.operators.
             return super().get_rhs_op(connection, rhs)
 
     def process_rhs(self, qn, connection):
         rhs, params = super().process_rhs(qn, connection)
-        if self.rhs_is_direct_value() and params and not self.bilateral_transforms:
-            params[0] = self.param_pattern % connection.ops.prep_for_like_query(
-                params[0]
-            )
+        # Assume the lookup is startswith. For simple lookups involving a
+        # Python value like "thevalue", the (SQL, params) is something like:
+        #     ("col LIKE %s", ['thevalue%'])
+        if self.is_simple_lookup:
+            # Prepare the lookup parameter, a Python value, for use in a LIKE
+            # clause, usually by adding % signs to the beginning and/or end of
+            # the value.
+            param = connection.ops.prep_for_like_query(params[0])
+            if connection.features.pattern_lookup_needs_param_pattern:
+                param = self.param_pattern % param
+            params = (param, *params[1:])
         return rhs, params
+
+    @property
+    def is_simple_lookup(self):
+        # A "simple lookup" is a Python value (as long as it's not a bilateral
+        # transform).
+        return self.rhs_is_direct_value() and not self.bilateral_transforms
 
 
 @Field.register_lookup
@@ -655,8 +691,9 @@ class Regex(BuiltinLookup):
         else:
             lhs, lhs_params = self.process_lhs(compiler, connection)
             rhs, rhs_params = self.process_rhs(compiler, connection)
+            params = (*lhs_params, *rhs_params)
             sql_template = connection.ops.regex_lookup(self.lookup_name)
-            return sql_template % (lhs, rhs), lhs_params + rhs_params
+            return sql_template % (lhs, rhs), params
 
 
 @Field.register_lookup
@@ -692,7 +729,7 @@ class YearLookup(Lookup):
             rhs_sql, _ = self.process_rhs(compiler, connection)
             rhs_sql = self.get_direct_rhs_sql(connection, rhs_sql)
             start, finish = self.year_lookup_bounds(connection, self.rhs)
-            params.extend(self.get_bound_params(start, finish))
+            params = (*params, *self.get_bound_params(start, finish))
             return "%s %s" % (lhs_sql, rhs_sql), params
         return super().as_sql(compiler, connection)
 

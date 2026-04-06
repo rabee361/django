@@ -1,5 +1,7 @@
 import sys
+import unittest
 from datetime import date
+from typing import TYPE_CHECKING
 from unittest import mock
 from unittest.mock import patch
 
@@ -30,6 +32,7 @@ from django.test import (
     override_settings,
 )
 from django.urls import reverse
+from django.utils.version import PY314
 from django.views.debug import ExceptionReporter, technical_500_response
 from django.views.decorators.debug import sensitive_variables
 
@@ -40,6 +43,10 @@ from .models import (
     ExtensionUser,
     UUIDUser,
 )
+
+if TYPE_CHECKING:
+    type AnnotatedUsername = str
+    type AnnotatedPassword = str
 
 
 class FilteredExceptionReporter(ExceptionReporter):
@@ -457,7 +464,9 @@ class BaseModelBackendTest:
         PASSWORD_HASHERS=["auth_tests.test_auth_backends.CountingMD5PasswordHasher"]
     )
     def test_authentication_timing(self):
-        """Hasher is run once regardless of whether the user exists. Refs #20760."""
+        """
+        Hasher is run once regardless of whether the user exists. Refs #20760.
+        """
         # Re-set the password, because this tests overrides PASSWORD_HASHERS
         self.user.set_password("test")
         self.user.save()
@@ -875,7 +884,8 @@ class InActiveUserBackendTest(TestCase):
 
 class PermissionDeniedBackend:
     """
-    Always raises PermissionDenied in `authenticate`, `has_perm` and `has_module_perms`.
+    Always raises PermissionDenied in `authenticate`, `has_perm` and
+    `has_module_perms`.
     """
 
     def authenticate(self, request, username=None, password=None):
@@ -920,7 +930,10 @@ class PermissionDeniedBackendTest(TestCase):
 
     @modify_settings(AUTHENTICATION_BACKENDS={"prepend": backend})
     def test_permission_denied(self):
-        "user is not authenticated after a backend raises permission denied #2550"
+        """
+        user is not authenticated after a backend raises permission denied
+        #2550
+        """
         self.assertIsNone(authenticate(username="test", password="test"))
         # user_login_failed signal is sent.
         self.assertEqual(
@@ -1278,6 +1291,29 @@ class AuthenticateTests(TestCase):
     )
     def test_skips_backends_with_decorated_method(self):
         self.assertEqual(authenticate(username="test", password="test"), self.user1)
+
+    @unittest.skipUnless(PY314, "Deferred annotations are Python 3.14+ only")
+    @override_settings(
+        AUTHENTICATION_BACKENDS=[
+            "auth_tests.test_auth_backends.AnnotatedBackend",
+        ],
+    )
+    def test_backend_uses_deferred_annotations(self):
+        class AnnotatedBackend:
+            invariant_user = self.user1
+
+            def authenticate(
+                self,
+                request: HttpRequest,
+                username: AnnotatedUsername,
+                password: AnnotatedPassword,
+            ) -> User | None:
+                return self.invariant_user
+
+        with unittest.mock.patch(
+            "django.contrib.auth.import_string", return_value=AnnotatedBackend
+        ):
+            self.assertEqual(authenticate(username="test", password="test"), self.user1)
 
 
 class ImproperlyConfiguredUserModelTest(TestCase):

@@ -8,6 +8,7 @@ from urllib.parse import quote as urlquote
 from urllib.parse import urlsplit
 
 from django import forms
+from django.apps import apps
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.admin import helpers, widgets
@@ -21,6 +22,7 @@ from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
 from django.contrib.admin.utils import (
     NestedObjects,
     construct_change_message,
+    display_for_value,
     flatten_fieldsets,
     get_deleted_objects,
     lookup_spawns_duplicates,
@@ -40,7 +42,6 @@ from django.core.exceptions import (
 from django.core.paginator import Paginator
 from django.db import models, router, transaction
 from django.db.models.constants import LOOKUP_SEP
-from django.db.models.functions import Cast
 from django.forms.formsets import DELETION_FIELD_NAME, all_valid
 from django.forms.models import (
     BaseInlineFormSet,
@@ -71,8 +72,10 @@ from django.views.decorators.csrf import csrf_protect
 from django.views.generic import RedirectView
 
 IS_POPUP_VAR = "_popup"
+SOURCE_MODEL_VAR = "_source_model"
 TO_FIELD_VAR = "_to_field"
 IS_FACETS_VAR = "_facets"
+EMPTY_VALUE_STRING = "-"
 
 
 class ShowFacets(enum.Enum):
@@ -170,10 +173,10 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
 
         # ForeignKey or ManyToManyFields
         if isinstance(db_field, (models.ForeignKey, models.ManyToManyField)):
-            # Combine the field kwargs with any options for formfield_overrides.
-            # Make sure the passed in **kwargs override anything in
-            # formfield_overrides because **kwargs is more specific, and should
-            # always win.
+            # Combine the field kwargs with any options for
+            # formfield_overrides. Make sure the passed in **kwargs override
+            # anything in formfield_overrides because **kwargs is more
+            # specific, and should always win.
             if db_field.__class__ in self.formfield_overrides:
                 kwargs = {**self.formfield_overrides[db_field.__class__], **kwargs}
 
@@ -250,7 +253,7 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
     def get_field_queryset(self, db, db_field, request):
         """
         If the ModelAdmin specifies ordering, the queryset should respect that
-        ordering.  Otherwise don't specify the queryset, let the field decide
+        ordering. Otherwise don't specify the queryset, let the field decide
         (return None in that case).
         """
         try:
@@ -507,7 +510,7 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         # Is it a valid relational lookup?
         return not {
             LOOKUP_SEP.join(relation_parts),
-            LOOKUP_SEP.join(relation_parts + [part]),
+            LOOKUP_SEP.join([*relation_parts, part]),
         }.isdisjoint(valid_lookups)
 
     def to_field_allowed(self, request, to_field):
@@ -737,8 +740,7 @@ class ModelAdmin(BaseModelAdmin):
                 "<path:object_id>/",
                 wrap(
                     RedirectView.as_view(
-                        pattern_name="%s:%s_%s_change"
-                        % ((self.admin_site.name,) + info)
+                        pattern_name="%s:%s_%s_change" % (self.admin_site.name, *info)
                     )
                 ),
             ),
@@ -1048,10 +1050,10 @@ class ModelAdmin(BaseModelAdmin):
 
     def get_action_choices(self, request, default_choices=models.BLANK_CHOICE_DASH):
         """
-        Return a list of choices for use in a form object.  Each choice is a
+        Return a list of choices for use in a form object. Each choice is a
         tuple (name, description).
         """
-        choices = [] + default_choices
+        choices = [*default_choices]
         for func, name, description in self.get_actions(request).values():
             choice = (name, description % model_format_dict(self.opts))
             choices.append(choice)
@@ -1060,7 +1062,7 @@ class ModelAdmin(BaseModelAdmin):
     def get_action(self, action):
         """
         Return a given action from a parameter, which can either be a callable,
-        or the name of a method on the ModelAdmin.  Return is a tuple of
+        or the name of a method on the ModelAdmin. Return is a tuple of
         (callable, name, description).
         """
         # If the action is a callable, just use it.
@@ -1136,6 +1138,12 @@ class ModelAdmin(BaseModelAdmin):
 
         # Apply keyword searches.
         def construct_search(field_name):
+            """
+            Return a tuple of (lookup, field_to_validate).
+
+            field_to_validate is set for non-text exact lookups so that
+            invalid search terms can be skipped (preserving index usage).
+            """
             if field_name.startswith("^"):
                 return "%s__istartswith" % field_name.removeprefix("^"), None
             elif field_name.startswith("="):
@@ -1147,7 +1155,7 @@ class ModelAdmin(BaseModelAdmin):
             lookup_fields = field_name.split(LOOKUP_SEP)
             # Go through the fields, following all relations.
             prev_field = None
-            for i, path_part in enumerate(lookup_fields):
+            for path_part in lookup_fields:
                 if path_part == "pk":
                     path_part = opts.pk.name
                 try:
@@ -1158,15 +1166,9 @@ class ModelAdmin(BaseModelAdmin):
                         if path_part == "exact" and not isinstance(
                             prev_field, (models.CharField, models.TextField)
                         ):
-                            field_name_without_exact = "__".join(lookup_fields[:i])
-                            alias = Cast(
-                                field_name_without_exact,
-                                output_field=models.CharField(),
-                            )
-                            alias_name = "_".join(lookup_fields[:i])
-                            return f"{alias_name}_str", alias
-                        else:
-                            return field_name, None
+                            # Use prev_field to validate the search term.
+                            return field_name, prev_field
+                        return field_name, None
                 else:
                     prev_field = field
                     if hasattr(field, "path_infos"):
@@ -1178,30 +1180,42 @@ class ModelAdmin(BaseModelAdmin):
         may_have_duplicates = False
         search_fields = self.get_search_fields(request)
         if search_fields and search_term:
-            str_aliases = {}
             orm_lookups = []
             for field in search_fields:
-                lookup, str_alias = construct_search(str(field))
-                orm_lookups.append(lookup)
-                if str_alias:
-                    str_aliases[lookup] = str_alias
-
-            if str_aliases:
-                queryset = queryset.alias(**str_aliases)
+                orm_lookups.append(construct_search(str(field)))
 
             term_queries = []
             for bit in smart_split(search_term):
                 if bit.startswith(('"', "'")) and bit[0] == bit[-1]:
                     bit = unescape_string_literal(bit)
-                or_queries = models.Q.create(
-                    [(orm_lookup, bit) for orm_lookup in orm_lookups],
-                    connector=models.Q.OR,
-                )
-                term_queries.append(or_queries)
-            queryset = queryset.filter(models.Q.create(term_queries))
+                # Build term lookups, skipping values invalid for their field.
+                bit_lookups = []
+                for orm_lookup, validate_field in orm_lookups:
+                    if validate_field is not None:
+                        formfield = validate_field.formfield()
+                        try:
+                            if formfield is not None:
+                                value = formfield.to_python(bit)
+                            else:
+                                # Fields like AutoField lack a form field.
+                                value = validate_field.to_python(bit)
+                        except ValidationError:
+                            # Skip this lookup for invalid values.
+                            continue
+                    else:
+                        value = bit
+                    bit_lookups.append((orm_lookup, value))
+                if bit_lookups:
+                    or_queries = models.Q.create(bit_lookups, connector=models.Q.OR)
+                    term_queries.append(or_queries)
+                else:
+                    # No valid lookups: add a filter that returns nothing.
+                    term_queries.append(models.Q(pk__in=[]))
+            if term_queries:
+                queryset = queryset.filter(models.Q.create(term_queries))
             may_have_duplicates |= any(
                 lookup_spawns_duplicates(self.opts, search_spec)
-                for search_spec in orm_lookups
+                for search_spec, _ in orm_lookups
             )
         return queryset, may_have_duplicates
 
@@ -1343,6 +1357,7 @@ class ModelAdmin(BaseModelAdmin):
                 "save_on_top": self.save_on_top,
                 "to_field_var": TO_FIELD_VAR,
                 "is_popup_var": IS_POPUP_VAR,
+                "source_model_var": SOURCE_MODEL_VAR,
                 "app_label": app_label,
             }
         )
@@ -1381,10 +1396,13 @@ class ModelAdmin(BaseModelAdmin):
             current_app=self.admin_site.name,
         )
         # Add a link to the object's change form if the user can edit the obj.
+        obj_display = display_for_value(str(obj), EMPTY_VALUE_STRING)
         if self.has_change_permission(request, obj):
-            obj_repr = format_html('<a href="{}">{}</a>', urlquote(obj_url), obj)
+            obj_repr = format_html(
+                '<a href="{}">{}</a>', urlquote(obj_url), obj_display
+            )
         else:
-            obj_repr = str(obj)
+            obj_repr = obj_display
         msg_dict = {
             "name": opts.verbose_name,
             "obj": obj_repr,
@@ -1399,12 +1417,41 @@ class ModelAdmin(BaseModelAdmin):
             else:
                 attr = obj._meta.pk.attname
             value = obj.serializable_value(attr)
-            popup_response_data = json.dumps(
-                {
-                    "value": str(value),
-                    "obj": str(obj),
-                }
-            )
+            popup_response = {
+                "value": str(value),
+                "obj": str(obj),
+            }
+
+            # Find the optgroup for the new item, if available
+            source_model_name = request.POST.get(SOURCE_MODEL_VAR)
+            source_admin = None
+            if source_model_name:
+                app_label, model_name = source_model_name.split(".", 1)
+                try:
+                    source_model = apps.get_model(app_label, model_name)
+                except LookupError:
+                    msg = _('The app "%s" could not be found.') % source_model_name
+                    self.message_user(request, msg, messages.ERROR)
+                else:
+                    source_admin = self.admin_site._registry.get(source_model)
+
+            if source_admin:
+                form = source_admin.get_form(request)()
+                if self.opts.verbose_name_plural in form.fields:
+                    field = form.fields[self.opts.verbose_name_plural]
+                    for option_value, option_label in field.choices:
+                        # Check if this is an optgroup (label is a sequence
+                        # of choices rather than a single string value).
+                        if isinstance(option_label, (list, tuple)):
+                            # It's an optgroup:
+                            # (group_name, [(value, label), ...])
+                            optgroup_label = option_value
+                            for choice_value, choice_display in option_label:
+                                if choice_display == str(obj):
+                                    popup_response["optgroup"] = str(optgroup_label)
+                                    break
+
+            popup_response_data = json.dumps(popup_response)
             return TemplateResponse(
                 request,
                 self.popup_response_template
@@ -1505,9 +1552,12 @@ class ModelAdmin(BaseModelAdmin):
         preserved_filters = self.get_preserved_filters(request)
         preserved_qsl = self._get_preserved_qsl(request, preserved_filters)
 
+        obj_display = display_for_value(str(obj), EMPTY_VALUE_STRING)
         msg_dict = {
             "name": opts.verbose_name,
-            "obj": format_html('<a href="{}">{}</a>', urlquote(request.path), obj),
+            "obj": format_html(
+                '<a href="{}">{}</a>', urlquote(request.path), obj_display
+            ),
         }
         if "_continue" in request.POST:
             msg = format_html(
@@ -1630,7 +1680,7 @@ class ModelAdmin(BaseModelAdmin):
             # the action explicitly on all objects.
             selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
             if not selected and not select_across:
-                # Reminder that something needs to be selected or nothing will happen
+                # Something needs to be selected or nothing will happen.
                 msg = _(
                     "Items must be selected in order to perform "
                     "actions on them. No items have been changed."
@@ -1686,7 +1736,7 @@ class ModelAdmin(BaseModelAdmin):
             _("The %(name)s “%(obj)s” was deleted successfully.")
             % {
                 "name": self.opts.verbose_name,
-                "obj": obj_display,
+                "obj": display_for_value(str(obj_display), EMPTY_VALUE_STRING),
             },
             messages.SUCCESS,
         )
@@ -1909,11 +1959,14 @@ class ModelAdmin(BaseModelAdmin):
         context = {
             **self.admin_site.each_context(request),
             "title": title % self.opts.verbose_name,
-            "subtitle": str(obj) if obj else None,
+            "subtitle": (
+                display_for_value(str(obj), EMPTY_VALUE_STRING) if obj else None
+            ),
             "adminform": admin_form,
             "object_id": object_id,
             "original": obj,
             "is_popup": IS_POPUP_VAR in request.POST or IS_POPUP_VAR in request.GET,
+            "source_model": request.GET.get(SOURCE_MODEL_VAR),
             "to_field": to_field,
             "media": media,
             "inline_admin_formsets": inline_formsets,
@@ -2051,11 +2104,6 @@ class ModelAdmin(BaseModelAdmin):
             # me back" button on the action confirmation page.
             return HttpResponseRedirect(request.get_full_path())
 
-        # If we're allowing changelist editing, we need to construct a formset
-        # for the changelist given all the fields to be edited. Then we'll
-        # use the formset to validate/process POSTed data.
-        formset = cl.formset = None
-
         # Handle POSTed bulk-edit data.
         if request.method == "POST" and cl.list_editable and "_save" in request.POST:
             if not self.has_change_permission(request):
@@ -2064,13 +2112,11 @@ class ModelAdmin(BaseModelAdmin):
             modified_objects = self._get_list_editable_queryset(
                 request, FormSet.get_default_prefix()
             )
-            formset = cl.formset = FormSet(
-                request.POST, request.FILES, queryset=modified_objects
-            )
-            if formset.is_valid():
+            cl.formset = FormSet(request.POST, request.FILES, queryset=modified_objects)
+            if cl.formset.is_valid():
                 changecount = 0
                 with transaction.atomic(using=router.db_for_write(self.model)):
-                    for form in formset.forms:
+                    for form in cl.formset.forms:
                         if form.has_changed():
                             obj = self.save_form(request, form, change=True)
                             self.save_model(request, obj, form, change=True)
@@ -2096,11 +2142,11 @@ class ModelAdmin(BaseModelAdmin):
         # Handle GET -- construct a formset for display.
         elif cl.list_editable and self.has_change_permission(request):
             FormSet = self.get_changelist_formset(request)
-            formset = cl.formset = FormSet(queryset=cl.result_list)
+            cl.formset = FormSet(queryset=cl.result_list)
 
         # Build the list of media to be used by the formset.
-        if formset:
-            media = self.media + formset.media
+        if cl.formset:
+            media = self.media + cl.formset.media
         else:
             media = self.media
 
@@ -2183,8 +2229,8 @@ class ModelAdmin(BaseModelAdmin):
         if obj is None:
             return self._get_obj_does_not_exist_redirect(request, self.opts, object_id)
 
-        # Populate deleted_objects, a data structure of all related objects that
-        # will also be deleted.
+        # Populate deleted_objects, a data structure of all related objects
+        # that will also be deleted.
         (
             deleted_objects,
             model_count,
@@ -2216,6 +2262,7 @@ class ModelAdmin(BaseModelAdmin):
             "subtitle": None,
             "object_name": object_name,
             "object": obj,
+            "escaped_object": display_for_value(str(obj), EMPTY_VALUE_STRING),
             "deleted_objects": deleted_objects,
             "model_count": dict(model_count).items(),
             "perms_lacking": perms_needed,
@@ -2264,7 +2311,8 @@ class ModelAdmin(BaseModelAdmin):
 
         context = {
             **self.admin_site.each_context(request),
-            "title": _("Change history: %s") % obj,
+            "title": _("Change history: %s")
+            % display_for_value(str(obj), EMPTY_VALUE_STRING),
             "subtitle": None,
             "action_list": page_obj,
             "page_range": page_range,
@@ -2400,7 +2448,7 @@ class InlineModelAdmin(BaseModelAdmin):
         return self.max_num
 
     def get_formset(self, request, obj=None, **kwargs):
-        """Return a BaseInlineFormSet class for use in admin add/change views."""
+        """Return a BaseInlineFormSet class for use in add/change views."""
         if "fields" in kwargs:
             fields = kwargs.pop("fields")
         else:

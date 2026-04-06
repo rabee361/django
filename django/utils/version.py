@@ -20,6 +20,7 @@ PY311 = sys.version_info >= (3, 11)
 PY312 = sys.version_info >= (3, 12)
 PY313 = sys.version_info >= (3, 13)
 PY314 = sys.version_info >= (3, 14)
+PY315 = sys.version_info >= (3, 15)
 
 
 def get_version(version=None):
@@ -96,7 +97,7 @@ def get_git_changeset():
         text=True,
     )
     timestamp = git_log.stdout
-    tz = datetime.timezone.utc
+    tz = datetime.UTC
     try:
         timestamp = datetime.datetime.fromtimestamp(int(timestamp), tz=tz)
     except ValueError:

@@ -13,7 +13,11 @@ from django.http import (
     RawPostDataException,
     UnreadablePostError,
 )
-from django.http.multipartparser import MAX_TOTAL_HEADER_SIZE, MultiPartParserError
+from django.http.multipartparser import (
+    MAX_TOTAL_HEADER_SIZE,
+    MultiPartParser,
+    MultiPartParserError,
+)
 from django.http.request import split_domain_port
 from django.test import RequestFactory, SimpleTestCase, override_settings
 from django.test.client import BOUNDARY, MULTIPART_CONTENT, FakePayload
@@ -53,20 +57,20 @@ class RequestsTests(SimpleTestCase):
 
     def test_httprequest_full_path(self):
         request = HttpRequest()
-        request.path = "/;some/?awful/=path/foo:bar/"
-        request.path_info = "/prefix" + request.path
+        request.path_info = "/;some/?awful/=path/foo:bar/"
+        request.path = "/prefix" + request.path_info
         request.META["QUERY_STRING"] = ";some=query&+query=string"
         expected = "/%3Bsome/%3Fawful/%3Dpath/foo:bar/?;some=query&+query=string"
-        self.assertEqual(request.get_full_path(), expected)
-        self.assertEqual(request.get_full_path_info(), "/prefix" + expected)
+        self.assertEqual(request.get_full_path_info(), expected)
+        self.assertEqual(request.get_full_path(), "/prefix" + expected)
 
     def test_httprequest_full_path_with_query_string_and_fragment(self):
         request = HttpRequest()
-        request.path = "/foo#bar"
-        request.path_info = "/prefix" + request.path
+        request.path_info = "/foo#bar"
+        request.path = "/prefix" + request.path_info
         request.META["QUERY_STRING"] = "baz#quux"
-        self.assertEqual(request.get_full_path(), "/foo%23bar?baz#quux")
-        self.assertEqual(request.get_full_path_info(), "/prefix/foo%23bar?baz#quux")
+        self.assertEqual(request.get_full_path_info(), "/foo%23bar?baz#quux")
+        self.assertEqual(request.get_full_path(), "/prefix/foo%23bar?baz#quux")
 
     def test_httprequest_repr(self):
         request = HttpRequest()
@@ -424,9 +428,9 @@ class RequestsTests(SimpleTestCase):
         """
         Reading body after parsing multipart/form-data is not allowed
         """
-        # Because multipart is used for large amounts of data i.e. file uploads,
-        # we don't want the data held in memory twice, and we don't want to
-        # silence the error by setting body = '' either.
+        # Because multipart is used for large amounts of data i.e. file
+        # uploads, we don't want the data held in memory twice, and we don't
+        # want to silence the error by setting body = '' either.
         payload = FakePayload(
             "\r\n".join(
                 [
@@ -449,6 +453,41 @@ class RequestsTests(SimpleTestCase):
         self.assertEqual(request.POST, {"name": ["value"]})
         with self.assertRaises(RawPostDataException):
             request.body
+
+    def test_malformed_multipart_header(self):
+        tests = [
+            ('Content-Disposition : form-data; name="name"', {"name": ["value"]}),
+            ('Content-Disposition:form-data; name="name"', {"name": ["value"]}),
+            ('Content-Disposition :form-data; name="name"', {"name": ["value"]}),
+            # The invalid encoding causes the entire part to be skipped.
+            (
+                'Content-Disposition: form-data; name="name"; '
+                "filename*=BOGUS''test%20file.txt",
+                {},
+            ),
+        ]
+        for header, expected_post in tests:
+            with self.subTest(header):
+                payload = FakePayload(
+                    "\r\n".join(
+                        [
+                            "--boundary",
+                            header,
+                            "",
+                            "value",
+                            "--boundary--",
+                        ]
+                    )
+                )
+                request = WSGIRequest(
+                    {
+                        "REQUEST_METHOD": "POST",
+                        "CONTENT_TYPE": "multipart/form-data; boundary=boundary",
+                        "CONTENT_LENGTH": len(payload),
+                        "wsgi.input": payload,
+                    }
+                )
+                self.assertEqual(request.POST, expected_post)
 
     def test_body_after_POST_multipart_related(self):
         """
@@ -881,7 +920,8 @@ class RequestsTests(SimpleTestCase):
     def test_POST_after_body_read_and_stream_read_multipart(self):
         """
         POST should be populated even if body is read first, and then
-        the stream is read second. Using multipart/form-data instead of urlencoded.
+        the stream is read second. Using multipart/form-data instead of
+        urlencoded.
         """
         payload = FakePayload(
             "\r\n".join(
@@ -1082,6 +1122,72 @@ class RequestsTests(SimpleTestCase):
         request_copy = copy.deepcopy(request)
         request.session["key"] = "value"
         self.assertEqual(request_copy.session, {})
+
+    def test_custom_multipart_parser_class(self):
+
+        class CustomMultiPartParser(MultiPartParser):
+            def parse(self):
+                post, files = super().parse()
+                post._mutable = True
+                post["custom_parser_used"] = "yes"
+                post._mutable = False
+                return post, files
+
+        class CustomWSGIRequest(WSGIRequest):
+            multipart_parser_class = CustomMultiPartParser
+
+        payload = FakePayload(
+            "\r\n".join(
+                [
+                    "--boundary",
+                    'Content-Disposition: form-data; name="name"',
+                    "",
+                    "value",
+                    "--boundary--",
+                ]
+            )
+        )
+        request = CustomWSGIRequest(
+            {
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": "multipart/form-data; boundary=boundary",
+                "CONTENT_LENGTH": len(payload),
+                "wsgi.input": payload,
+            }
+        )
+        self.assertEqual(request.POST.get("custom_parser_used"), "yes")
+        self.assertEqual(request.POST.get("name"), "value")
+
+    def test_multipart_parser_class_immutable_after_parse(self):
+        payload = FakePayload(
+            "\r\n".join(
+                [
+                    "--boundary",
+                    'Content-Disposition: form-data; name="name"',
+                    "",
+                    "value",
+                    "--boundary--",
+                ]
+            )
+        )
+        request = WSGIRequest(
+            {
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": "multipart/form-data; boundary=boundary",
+                "CONTENT_LENGTH": len(payload),
+                "wsgi.input": payload,
+            }
+        )
+
+        # Access POST to trigger parsing.
+        request.POST
+
+        msg = (
+            "You cannot set the multipart parser class after the upload has been "
+            "processed."
+        )
+        with self.assertRaisesMessage(RuntimeError, msg):
+            request.multipart_parser_class = MultiPartParser
 
 
 class HostValidationTests(SimpleTestCase):

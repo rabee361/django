@@ -1,12 +1,12 @@
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urljoin
 
 from django.conf import settings
 from django.core.files import File, locks
 from django.core.files.move import file_move_safe
 from django.core.signals import setting_changed
-from django.utils._os import safe_join
+from django.utils._os import safe_join, safe_makedirs
 from django.utils.deconstruct import deconstructible
 from django.utils.encoding import filepath_to_uri
 from django.utils.functional import cached_property
@@ -72,15 +72,10 @@ class FileSystemStorage(Storage, StorageSettingsMixin):
         directory = os.path.dirname(full_path)
         try:
             if self.directory_permissions_mode is not None:
-                # Set the umask because os.makedirs() doesn't apply the "mode"
+                # Workaround because os.makedirs() doesn't apply the "mode"
                 # argument to intermediate-level directories.
-                old_umask = os.umask(0o777 & ~self.directory_permissions_mode)
-                try:
-                    os.makedirs(
-                        directory, self.directory_permissions_mode, exist_ok=True
-                    )
-                finally:
-                    os.umask(old_umask)
+                # https://github.com/python/cpython/issues/86533
+                safe_makedirs(directory, self.directory_permissions_mode, exist_ok=True)
             else:
                 os.makedirs(directory, exist_ok=True)
         except FileExistsError:
@@ -104,8 +99,9 @@ class FileSystemStorage(Storage, StorageSettingsMixin):
 
                 # This is a normal uploadedfile that we can stream.
                 else:
-                    # The combination of O_CREAT and O_EXCL makes os.open() raises an
-                    # OSError if the file already exists before it's opened.
+                    # The combination of O_CREAT and O_EXCL makes os.open()
+                    # raises an OSError if the file already exists before it's
+                    # opened.
                     open_flags = (
                         os.O_WRONLY
                         | os.O_CREAT
@@ -113,7 +109,7 @@ class FileSystemStorage(Storage, StorageSettingsMixin):
                         | getattr(os, "O_BINARY", 0)
                     )
                     if self._allow_overwrite:
-                        open_flags = open_flags & ~os.O_EXCL
+                        open_flags = open_flags & ~os.O_EXCL | os.O_TRUNC
                     fd = os.open(full_path, open_flags, 0o666)
                     _file = None
                     try:
@@ -215,7 +211,7 @@ class FileSystemStorage(Storage, StorageSettingsMixin):
         If timezone support is enabled, make an aware datetime object in UTC;
         otherwise make a naive one in the local timezone.
         """
-        tz = timezone.utc if settings.USE_TZ else None
+        tz = UTC if settings.USE_TZ else None
         return datetime.fromtimestamp(ts, tz=tz)
 
     def get_accessed_time(self, name):

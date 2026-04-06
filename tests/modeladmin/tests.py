@@ -73,12 +73,13 @@ class ModelAdminTests(TestCase):
         self.assertIsNone(ma.get_exclude(request, self.band))
 
     def test_default_fieldsets(self):
-        # fieldsets_add and fieldsets_change should return a special data structure that
-        # is used in the templates. They should generate the "right thing" whether we
-        # have specified a custom form, the fields argument, or nothing at all.
+        # fieldsets_add and fieldsets_change should return a special data
+        # structure that is used in the templates. They should generate the
+        # "right thing" whether we have specified a custom form, the fields
+        # argument, or nothing at all.
         #
-        # Here's the default case. There are no custom form_add/form_change methods,
-        # no fields argument, and no fieldsets argument.
+        # Here's the default case. There are no custom form_add/form_change
+        # methods, no fields argument, and no fieldsets argument.
         ma = ModelAdmin(Band, self.site)
         self.assertEqual(
             ma.get_fieldsets(request),
@@ -294,7 +295,8 @@ class ModelAdminTests(TestCase):
         # Form class to the fields specified. This may cause errors to be
         # raised in the db layer if required model fields aren't in fields/
         # fieldsets, but that's preferable to ghost errors where a field in the
-        # Form class isn't being displayed because it's not in fields/fieldsets.
+        # Form class isn't being displayed because it's not in
+        # fields/fieldsets.
 
         # Using `fields`.
         class BandAdmin(ModelAdmin):
@@ -403,7 +405,8 @@ class ModelAdminTests(TestCase):
     def test_custom_form_meta_exclude(self):
         """
         The custom ModelForm's `Meta.exclude` is overridden if
-        `ModelAdmin.exclude` or `InlineModelAdmin.exclude` are defined (#14496).
+        `ModelAdmin.exclude` or `InlineModelAdmin.exclude` are defined
+        (#14496).
         """
 
         # With ModelAdmin
@@ -634,8 +637,8 @@ class ModelAdminTests(TestCase):
             '<select data-context="available-source" '
             'name="main_band" id="id_main_band" required>'
             '<option value="" selected>---------</option>'
-            '<option value="%d">The Beatles</option>'
-            '<option value="%d">The Doors</option>'
+            '<option value="%s">The Beatles</option>'
+            '<option value="%s">The Doors</option>'
             "</select></div>" % (band2.id, self.band.id),
         )
 
@@ -658,7 +661,7 @@ class ModelAdminTests(TestCase):
             '<select data-context="available-source" '
             'name="main_band" id="id_main_band" required>'
             '<option value="" selected>---------</option>'
-            '<option value="%d">The Doors</option>'
+            '<option value="%s">The Doors</option>'
             "</select></div>" % self.band.id,
         )
 
@@ -702,9 +705,10 @@ class ModelAdminTests(TestCase):
     def test_default_foreign_key_widget(self):
         # First, without any radio_fields specified, the widgets for ForeignKey
         # and fields with choices specified ought to be a basic Select widget.
-        # ForeignKey widgets in the admin are wrapped with RelatedFieldWidgetWrapper so
-        # they need to be handled properly when type checking. For Select fields, all of
-        # the choices lists have a first entry of dashes.
+        # ForeignKey widgets in the admin are wrapped with
+        # RelatedFieldWidgetWrapper so they need to be handled properly when
+        # type checking. For Select fields, all of the choices lists have a
+        # first entry of dashes.
         cma = ModelAdmin(Concert, self.site)
         cmafa = cma.get_form(request)
 
@@ -731,10 +735,11 @@ class ModelAdminTests(TestCase):
         )
 
     def test_foreign_key_as_radio_field(self):
-        # Now specify all the fields as radio_fields.  Widgets should now be
-        # RadioSelect, and the choices list should have a first entry of 'None' if
-        # blank=True for the model field.  Finally, the widget should have the
-        # 'radiolist' attr, and 'inline' as well if the field is specified HORIZONTAL.
+        # Now specify all the fields as radio_fields. Widgets should now be
+        # RadioSelect, and the choices list should have a first entry of 'None'
+        # if blank=True for the model field. Finally, the widget should have
+        # the 'radiolist' attr, and 'inline' as well if the field is specified
+        # HORIZONTAL.
         class ConcertAdmin(ModelAdmin):
             radio_fields = {
                 "main_band": HORIZONTAL,
@@ -824,6 +829,57 @@ class ModelAdminTests(TestCase):
             list(list(ma.get_formsets_with_inlines(request))[0][0]().forms[0].fields),
             ["extra", "transport", "id", "DELETE", "main_band"],
         )
+
+    def test_foreign_key_as_custom_widget(self):
+        class CustomSelectMultiple(forms.SelectMultiple):
+            def build_attrs(self, base_attrs, extra_attrs=None):
+                attrs = super().build_attrs(base_attrs, extra_attrs)
+                attrs["data-custom-widget"] = "true"
+                return attrs
+
+        class ConcertAdmin(ModelAdmin):
+            formfield_overrides = {
+                models.ForeignKey: {"widget": CustomSelectMultiple},
+            }
+
+        cma = ConcertAdmin(Concert, self.site)
+        cmafa = cma.get_form(request)
+        expected = (
+            '<div><label for="id_main_band">Main band:</label><div '
+            'class="related-widget-wrapper" data-model-ref="band"><select '
+            'name="main_band" data-context="available-source" required '
+            'id="id_main_band" data-custom-widget="true" multiple>'
+            '<option value="">---------</option>'
+            f'<option value="{self.band.pk}">The Doors</option>'
+            "</select></div></div>"
+        )
+        self.assertInHTML(expected, cmafa().render())
+
+    def test_foreign_key_as_custom_widget_with_fieldset(self):
+        class CustomSelectMultipleFieldset(forms.RadioSelect):
+            use_fieldset = True
+
+            def build_attrs(self, base_attrs, extra_attrs=None):
+                attrs = super().build_attrs(base_attrs, extra_attrs)
+                attrs["use_fieldset"] = "true"
+                return attrs
+
+        class ConcertAdmin(ModelAdmin):
+            formfield_overrides = {
+                models.ForeignKey: {"widget": CustomSelectMultipleFieldset},
+            }
+
+        cma = ConcertAdmin(Concert, self.site)
+        cmafa = cma.get_form(request)
+        expected = (
+            '<fieldset><legend>Main band:</legend><div class="related-widget-wrapper" '
+            'data-model-ref="band"><div id="id_main_band"><div><label '
+            'for="id_main_band_0"><input type="radio" name="main_band" '
+            f'value="{self.band.pk}" data-context="available-source" '
+            'required id="id_main_band_0" use_fieldset="true">The Doors</label>'
+            "</div></div></div></fieldset>"
+        )
+        self.assertInHTML(expected, cmafa().render())
 
     def test_log_actions(self):
         ma = ModelAdmin(Band, self.site)
@@ -937,8 +993,8 @@ class ModelAdminTests(TestCase):
 
     def test_get_deleted_objects_with_custom_has_delete_permission(self):
         """
-        ModelAdmin.get_deleted_objects() uses ModelAdmin.has_delete_permission()
-        for permissions checking.
+        ModelAdmin.get_deleted_objects() uses
+        ModelAdmin.has_delete_permission() for permissions checking.
         """
         mock_request = MockRequest()
         mock_request.user = User.objects.create_superuser(

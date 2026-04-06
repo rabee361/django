@@ -21,7 +21,8 @@ from django.utils.module_loading import module_dir
 
 class MigrationTestBase(TransactionTestCase):
     """
-    Contains an extended set of asserts for testing migrations and schema operations.
+    Contains an extended set of asserts for testing migrations and schema
+    operations.
     """
 
     available_apps = ["migrations"]
@@ -107,6 +108,7 @@ class MigrationTestBase(TransactionTestCase):
                     .values()
                     if (
                         c["columns"] == list(columns)
+                        and c["index"] is True
                         and (index_type is None or c["type"] == index_type)
                         and not c["unique"]
                     )
@@ -288,14 +290,13 @@ class OperationTestBase(MigrationTestBase):
     ):
         """Creates a test model state and database table."""
         # Make the "current" state.
-        model_options = {
-            "swappable": "TEST_SWAP_MODEL",
-            "unique_together": [["pink", "weight"]] if unique_together else [],
-        }
+        model_options = {"swappable": "TEST_SWAP_MODEL"}
         if options:
             model_options["permissions"] = [("can_groom", "Can groom")]
         if db_table:
             model_options["db_table"] = db_table
+        if unique_together:
+            model_options["unique_together"] = {("pink", "weight")}
         operations = [
             migrations.CreateModel(
                 "Pony",

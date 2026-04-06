@@ -30,7 +30,7 @@ class Mixin:
 class OperationTests(OperationTestBase):
     """
     Tests running the operations and making sure they do what they say they do.
-    Each test looks at their state changing, and then their database operation -
+    Each test looks at their state changing, and then their database operation,
     both forwards and backwards.
     """
 
@@ -955,7 +955,8 @@ class OperationTests(OperationTestBase):
         operation.state_forwards("test_rmwsc", new_state)
         self.assertNotIn(("test_rmwsc", "shetlandpony"), new_state.models)
         self.assertIn(("test_rmwsc", "littlehorse"), new_state.models)
-        # RenameModel shouldn't repoint the superclass's relations, only local ones
+        # RenameModel shouldn't repoint the superclass's relations, only local
+        # ones
         self.assertEqual(
             project_state.models["test_rmwsc", "rider"]
             .fields["pony"]
@@ -1490,7 +1491,7 @@ class OperationTests(OperationTestBase):
                             "name_and_id",
                             models.GeneratedField(
                                 expression=Concat(("name"), ("rider_id")),
-                                output_field=models.TextField(),
+                                output_field=models.CharField(max_length=60),
                                 db_persist=True,
                             ),
                         ),
@@ -1539,7 +1540,7 @@ class OperationTests(OperationTestBase):
                     "digits",
                     models.CharField(max_length=10, default="42"),
                 ),
-                # Manual quoting is fragile and could trip on quotes. Refs #xyz.
+                # Manual quoting is fragile and could trip on quotes.
                 migrations.AddField(
                     "Pony",
                     "quotes",
@@ -1584,7 +1585,7 @@ class OperationTests(OperationTestBase):
                     "digits",
                     models.TextField(default="42"),
                 ),
-                # Manual quoting is fragile and could trip on quotes. Refs #xyz.
+                # Manual quoting is fragile and could trip on quotes.
                 migrations.AddField(
                     "Pony",
                     "quotes",
@@ -1629,7 +1630,7 @@ class OperationTests(OperationTestBase):
                     "digits",
                     models.BinaryField(default=b"42"),
                 ),
-                # Manual quoting is fragile and could trip on quotes. Refs #xyz.
+                # Manual quoting is fragile and could trip on quotes.
                 migrations.AddField(
                     "Pony",
                     "quotes",
@@ -2055,8 +2056,13 @@ class OperationTests(OperationTestBase):
         self.assertEqual(len(new_state.models["test_rmfl", "pony"].fields), 4)
         # Test the database alteration
         self.assertColumnExists("test_rmfl_pony", "pink")
-        with connection.schema_editor() as editor:
+        with (
+            connection.schema_editor() as editor,
+            CaptureQueriesContext(connection) as ctx,
+        ):
             operation.database_forwards("test_rmfl", editor, project_state, new_state)
+        self.assertGreater(len(ctx.captured_queries), 0)
+        self.assertNotIn("CASCADE", ctx.captured_queries[-1]["sql"])
         self.assertColumnNotExists("test_rmfl_pony", "pink")
         # And test reversal
         with connection.schema_editor() as editor:
@@ -2333,6 +2339,36 @@ class OperationTests(OperationTestBase):
             operation.database_backwards(app_label, editor, new_state, project_state)
         pony = project_state.apps.get_model(app_label, "pony").objects.create(weight=1)
         self.assertEqual(pony.pink, 3)
+
+    @skipUnlessDBFeature("supports_expression_defaults")
+    def test_alter_field_add_database_default_func(self):
+        app_label = "test_alfladdf"
+        project_state = self.set_up_test_model(app_label)
+        operation = migrations.AlterField(
+            "Pony", "weight", models.FloatField(db_default=Pi())
+        )
+        new_state = project_state.clone()
+        operation.state_forwards(app_label, new_state)
+        old_weight = project_state.models[app_label, "pony"].fields["weight"]
+        self.assertIs(old_weight.default, models.NOT_PROVIDED)
+        self.assertIs(old_weight.db_default, models.NOT_PROVIDED)
+        new_weight = new_state.models[app_label, "pony"].fields["weight"]
+        self.assertIs(new_weight.default, models.NOT_PROVIDED)
+        self.assertIsInstance(new_weight.db_default, Pi)
+        pony = project_state.apps.get_model(app_label, "pony").objects.create(weight=1)
+        self.assertEqual(pony.weight, 1)
+        # Alter field.
+        with connection.schema_editor() as editor:
+            operation.database_forwards(app_label, editor, project_state, new_state)
+        pony = new_state.apps.get_model(app_label, "pony").objects.create()
+        if not connection.features.can_return_columns_from_insert:
+            pony.refresh_from_db()
+        self.assertAlmostEqual(pony.weight, math.pi)
+        # Reversal.
+        with connection.schema_editor() as editor:
+            operation.database_backwards(app_label, editor, new_state, project_state)
+        pony = project_state.apps.get_model(app_label, "pony").objects.create(weight=1)
+        self.assertEqual(pony.weight, 1)
 
     def test_alter_field_change_nullable_to_database_default_not_null(self):
         """
@@ -2611,7 +2647,8 @@ class OperationTests(OperationTestBase):
     @skipUnlessDBFeature("supports_foreign_keys")
     def test_alter_field_pk_fk(self):
         """
-        Tests the AlterField operation on primary keys changes any FKs pointing to it.
+        Tests the AlterField operation on primary keys changes any FKs pointing
+        to it.
         """
         project_state = self.set_up_test_model("test_alflpkfk", related_model=True)
         project_state = self.apply_operations(
@@ -3299,11 +3336,11 @@ class OperationTests(OperationTestBase):
         # unique_together has the renamed column.
         self.assertIn(
             "blue",
-            new_state.models["test_rnflut", "pony"].options["unique_together"][0],
+            list(new_state.models["test_rnflut", "pony"].options["unique_together"])[0],
         )
         self.assertNotIn(
             "pink",
-            new_state.models["test_rnflut", "pony"].options["unique_together"][0],
+            list(new_state.models["test_rnflut", "pony"].options["unique_together"])[0],
         )
         # Rename field.
         self.assertColumnExists("test_rnflut_pony", "pink")
@@ -3340,7 +3377,7 @@ class OperationTests(OperationTestBase):
                     ("weight", models.FloatField()),
                 ],
                 options={
-                    "index_together": [("weight", "pink")],
+                    "index_together": {("weight", "pink")},
                 },
             ),
         ]
@@ -3353,10 +3390,12 @@ class OperationTests(OperationTestBase):
         self.assertNotIn("pink", new_state.models["test_rnflit", "pony"].fields)
         # index_together has the renamed column.
         self.assertIn(
-            "blue", new_state.models["test_rnflit", "pony"].options["index_together"][0]
+            "blue",
+            list(new_state.models["test_rnflit", "pony"].options["index_together"])[0],
         )
         self.assertNotIn(
-            "pink", new_state.models["test_rnflit", "pony"].options["index_together"][0]
+            "pink",
+            list(new_state.models["test_rnflit", "pony"].options["index_together"])[0],
         )
 
         # Rename field.
@@ -3915,7 +3954,7 @@ class OperationTests(OperationTestBase):
                     ("weight", models.FloatField()),
                 ],
                 options={
-                    "index_together": [("weight", "pink")],
+                    "index_together": {("weight", "pink")},
                 },
             ),
         ]
@@ -3935,6 +3974,11 @@ class OperationTests(OperationTestBase):
         )
         new_state = project_state.clone()
         operation.state_forwards(app_label, new_state)
+        # Ensure the model state has the correct type for the index_together
+        # option.
+        self.assertIsInstance(
+            new_state.models[app_label, "pony"].options["index_together"], set
+        )
         # Rename index.
         with connection.schema_editor() as editor:
             operation.database_forwards(app_label, editor, project_state, new_state)
@@ -4042,7 +4086,7 @@ class OperationTests(OperationTestBase):
                     ("weight", models.FloatField()),
                 ],
                 options={
-                    "index_together": [("weight", "pink")],
+                    "index_together": {("weight", "pink")},
                 },
             ),
         ]
@@ -5499,6 +5543,10 @@ class OperationTests(OperationTestBase):
         elidable_operation = migrations.RunSQL("SELECT 1 FROM void;", elidable=True)
         self.assertEqual(elidable_operation.reduce(operation, []), [operation])
 
+        # Test elidable deconstruction
+        definition = elidable_operation.deconstruct()
+        self.assertIs(definition[2]["elidable"], True)
+
     def test_run_sql_params(self):
         """
         #23426 - RunSQL should accept parameters.
@@ -5752,11 +5800,16 @@ class OperationTests(OperationTestBase):
         elidable_operation = migrations.RunPython(inner_method, elidable=True)
         self.assertEqual(elidable_operation.reduce(operation, []), [operation])
 
+        # Test elidable deconstruction
+        definition = elidable_operation.deconstruct()
+        self.assertIs(definition[2]["elidable"], True)
+
     def test_run_python_invalid_reverse_code(self):
         msg = "RunPython must be supplied with callable arguments"
         with self.assertRaisesMessage(ValueError, msg):
             migrations.RunPython(code=migrations.RunPython.noop, reverse_code="invalid")
 
+    @skipUnlessDBFeature("supports_transactions")
     def test_run_python_atomic(self):
         """
         Tests the RunPython operation correctly handles the "atomic" keyword
@@ -5777,7 +5830,8 @@ class OperationTests(OperationTestBase):
         non_atomic_migration.operations = [
             migrations.RunPython(inner_method, reverse_code=inner_method, atomic=False)
         ]
-        # If we're a fully-transactional database, both versions should rollback
+        # If we're a fully-transactional database, both versions should
+        # rollback
         if connection.features.can_rollback_ddl:
             self.assertEqual(
                 project_state.apps.get_model(
@@ -6325,6 +6379,15 @@ class OperationTests(OperationTestBase):
             ("test_igfc_2", generated_1, regular),
             ("test_igfc_3", generated_1, generated_2),
         ]
+        if not connection.features.supports_alter_generated_column_data_type:
+            generated_3 = models.GeneratedField(
+                expression=F("pink") + F("pink"),
+                output_field=models.DecimalField(decimal_places=2, max_digits=16),
+                db_persist=db_persist,
+            )
+            tests.append(
+                ("test_igfc_4", generated_1, generated_3),
+            )
         for app_label, add_field, alter_field in tests:
             project_state = self.set_up_test_model(app_label)
             operations = [
@@ -6403,7 +6466,7 @@ class OperationTests(OperationTestBase):
                 "Pony",
                 "modified_pink",
                 models.GeneratedField(
-                    expression=F("pink"),
+                    expression=F("pink") + 2,
                     output_field=models.IntegerField(),
                     db_persist=True,
                 ),
@@ -6412,7 +6475,7 @@ class OperationTests(OperationTestBase):
                 "Pony",
                 "modified_pink",
                 models.GeneratedField(
-                    expression=F("pink"),
+                    expression=F("pink") + 2,
                     output_field=models.IntegerField(),
                     db_persist=False,
                 ),
@@ -6451,7 +6514,9 @@ class OperationTests(OperationTestBase):
             operation.database_backwards(app_label, editor, new_state, project_state)
         self.assertColumnNotExists(f"{app_label}_pony", "modified_pink")
 
-    @skipUnlessDBFeature("supports_stored_generated_columns")
+    @skipUnlessDBFeature(
+        "supports_stored_generated_columns", "supports_alter_generated_column_data_type"
+    )
     def test_generated_field_changes_output_field(self):
         app_label = "test_gfcof"
         operation = migrations.AddField(
@@ -6833,6 +6898,21 @@ class FieldOperationTests(SimpleTestCase):
         self.assertIs(
             operation.references_field("Through", "second", "migrations"), True
         )
+
+    def test_references_field_by_generated_field(self):
+        operation = FieldOperation(
+            "Model",
+            "field",
+            models.GeneratedField(
+                expression=F("foo") + F("bar"),
+                output_field=models.IntegerField(),
+                db_persist=True,
+            ),
+        )
+        self.assertIs(operation.references_field("Model", "foo", "migrations"), True)
+        self.assertIs(operation.references_field("Model", "bar", "migrations"), True)
+        self.assertIs(operation.references_field("Model", "alien", "migrations"), False)
+        self.assertIs(operation.references_field("Other", "foo", "migrations"), False)
 
 
 class BaseOperationTests(SimpleTestCase):
